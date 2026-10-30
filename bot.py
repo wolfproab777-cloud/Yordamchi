@@ -7,9 +7,8 @@ from aiogram.types import BufferedInputFile, BusinessMessagesDeleted, Message
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2.5-sunburst")
-ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
@@ -35,36 +34,41 @@ def load(chat_id, message_id):
 
 
 # ---------- Rasm ----------
-async def better_prompt(idea: str) -> str:
-    if not ANTHROPIC_KEY:
-        return idea
-    try:
-        from anthropic import AsyncAnthropic
-        r = await AsyncAnthropic(api_key=ANTHROPIC_KEY).messages.create(
-            model="claude-sonnet-4-6", max_tokens=300,
-            system="Translate and expand the idea into one detailed English image prompt "
-                   "(style, lighting, composition, quality). Keep the subject, gender, age "
-                   "and number of people EXACTLY as stated; never assume a gender. Reply with ONLY the prompt.",
-            messages=[{"role": "user", "content": idea}])
-        return r.content[0].text.strip()
-    except Exception as e:
-        logging.warning("Claude xatosi: %s", e)
-        return idea
+async def gemini_image(prompt: str) -> bytes:
+    """Google Gemini (Nano Banana), o'zbekchani o'zi tushunadi."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    body = {"contents": [{"parts": [{"text": f"Generate an image: {prompt}"}]}]}
+    async with aiohttp.ClientSession() as s, s.post(
+        url, json=body, headers={"x-goog-api-key": GEMINI_KEY},
+        timeout=aiohttp.ClientTimeout(total=120),
+    ) as r:
+        data = await r.json()
+        if r.status != 200:
+            raise RuntimeError(f"{r.status}: {data.get('error', {}).get('message', data)}")
+    for part in data["candidates"][0]["content"]["parts"]:
+        blob = part.get("inlineData") or part.get("inline_data")
+        if blob:
+            return base64.b64decode(blob["data"])
+    raise RuntimeError("Gemini rasm qaytarmadi")
 
 
 async def make_image(prompt: str) -> bytes:
-    if OPENAI_KEY:
+    if GEMINI_KEY:
         try:
-            from openai import AsyncOpenAI
-            r = await AsyncOpenAI(api_key=OPENAI_KEY).images.generate(
-                model=OPENAI_IMAGE_MODEL, prompt=prompt, size="1024x1024")
-            return base64.b64decode(r.data[0].b64_json)
+            return await gemini_image(prompt)
         except Exception as e:
-            logging.warning("OpenAI xatosi, bepul variantga o'tildi: %s", e)
+            logging.warning("Gemini xatosi: %s", e)
     url = "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt) + "?width=1024&height=1024&nologo=true"
-    async with aiohttp.ClientSession() as s, s.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
-        r.raise_for_status()
-        return await r.read()
+    for attempt in range(4):  # bepul server band bo'lsa, 4 martagacha qayta uriniladi
+        try:
+            async with aiohttp.ClientSession() as s, s.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
+                if r.status == 200:
+                    return await r.read()
+                logging.warning("Pollinations %s (urinish %s)", r.status, attempt + 1)
+        except Exception as e:
+            logging.warning("Pollinations xatosi: %s", e)
+        await asyncio.sleep(5)
+    raise RuntimeError("Bepul rasm serveri hozir band. Birozdan keyin qayta urinib ko'ring.")
 
 
 @dp.message(CommandStart())
@@ -79,9 +83,8 @@ async def generate(m: Message):
         return
     wait = await m.answer("Rasm tayyorlanmoqda...")
     try:
-        prompt = await better_prompt(m.text)
-        img = await make_image(prompt)
-        await m.answer_photo(BufferedInputFile(img, "image.png"), caption=prompt[:900])
+        img = await make_image(m.text)
+        await m.answer_photo(BufferedInputFile(img, "image.png"), caption=m.text[:900])
     except Exception as e:
         await m.answer(f"Xatolik: {e}")
     finally:
@@ -133,3 +136,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
