@@ -448,4 +448,534 @@ def size_kb(l):
 
 
 def voice_kb(l):
-    b = lamb
+    b = lambda k: (T[l]["v_" + k], "v:" + k)
+    return ikb([[b("boy"), b("girl")], [b("old"), b("robot")], [b("fem"), b("hacker")]])
+
+
+def speed_kb(l):
+    b = lambda k: (T[l]["sp_" + k], "sp:" + k)
+    return ikb([[b("slow"), b("norm"), b("fast")]])
+
+
+def contact_kb(l):
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=T[l]["btn_contact"], request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True)
+
+
+PICKERS = {  # tanlash kutilayotgan holat -> (matn kaliti, tugmalar)
+    "style_pick": ("ask_style", style_kb), "size_pick": ("ask_size", size_kb),
+    "voice_pick": ("ask_voice", voice_kb), "speed_pick": ("ask_speed", speed_kb),
+    "tr_pick": ("ask_tr", lambda l: tr_kb()),
+}
+
+
+async def ask_language(target: Message):
+    await target.answer("Tilni tanlang / Выберите язык / Choose language:", reply_markup=lang_kb())
+
+
+# ---------- Taqiqlangan foydalanuvchilar ----------
+class BanMW(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        u = getattr(event, "from_user", None)
+        if u and u.id in BANNED and u.id != OWNER_ID:
+            return None
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(BanMW())
+dp.callback_query.outer_middleware(BanMW())
+
+
+# ---------- Boshlash, til, kontakt ----------
+@dp.message(CommandStart())
+@dp.message(Command("menu"))
+async def start(m: Message):
+    uid = m.from_user.id
+    if uid == OWNER_ID and not get_user(uid):
+        db.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)",
+                   (uid, "uz", "-", m.from_user.full_name, m.from_user.username or "", now()))
+        db.commit()
+    if get_user(uid):
+        STATE.pop(uid, None)
+        await m.answer(T[lang_of(uid)]["menu"], reply_markup=menu_kb(lang_of(uid)))
+    else:
+        await ask_language(m)
+
+
+@dp.message(Command("lang"))
+async def change_lang(m: Message):
+    await ask_language(m)
+
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def pick_lang(cb: CallbackQuery):
+    l, uid = cb.data.split(":")[1], cb.from_user.id
+    if l not in T:
+        return await cb.answer()
+    await cb.answer()
+    if get_user(uid):
+        db.execute("UPDATE users SET lang=? WHERE id=?", (l, uid))
+        db.commit()
+        await cb.message.answer(T[l]["menu"], reply_markup=menu_kb(l))
+    else:
+        PENDING[uid] = l
+        await cb.message.answer(T[l]["contact"], reply_markup=contact_kb(l))
+
+
+@dp.message(F.contact)
+async def got_contact(m: Message):
+    uid = m.from_user.id
+    if uid not in PENDING:
+        if get_user(uid):
+            await m.answer(T[lang_of(uid)]["menu"], reply_markup=menu_kb(lang_of(uid)))
+        else:
+            await ask_language(m)
+        return
+    l = PENDING[uid]
+    if m.contact.user_id != uid:  # boshqaning kontaktini qabul qilmaymiz
+        await m.answer(T[l]["bad_contact"], reply_markup=contact_kb(l))
+        return
+    PENDING.pop(uid)
+    db.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?,?)",
+               (uid, l, m.contact.phone_number, m.from_user.full_name, m.from_user.username or "", now()))
+    db.commit()
+    await m.answer(T[l]["registered"], reply_markup=ReplyKeyboardRemove())
+    await m.answer(T[l]["menu"], reply_markup=menu_kb(l))
+    if OWNER_ID:  # egasiga xabar
+        try:
+            await bot.send_message(
+                OWNER_ID,
+                "🆕 <b>Yangi foydalanuvchi</b>\n"
+                f"Ism: {html.escape(m.from_user.full_name)}\n"
+                f"Username: {'@' + html.escape(m.from_user.username) if m.from_user.username else 'yo`q'}\n"
+                f"ID: <code>{uid}</code>\n"
+                f"Telefon: <code>{html.escape(m.contact.phone_number)}</code>\n"
+                f"Til: {l}\n"
+                f'<a href="tg://user?id={uid}">Profilni ochish</a>',
+                parse_mode="HTML")
+        except Exception as e:
+            logging.warning("Egasiga xabar yuborilmadi: %s", e)
+
+
+# ---------- Menyu tugmalari ----------
+async def show_picker(target: Message, uid: int, mode: str):
+    STATE[uid] = {"mode": mode}
+    l = lang_of(uid)
+    key, kb = PICKERS[mode]
+    await target.answer(T[l][key], reply_markup=kb(l))
+
+
+async def choose(target: Message, uid: int, what: str):
+    if what == "img":
+        await show_picker(target, uid, "style_pick")
+    elif what == "tts":
+        await show_picker(target, uid, "voice_pick")
+    elif what == "tr":
+        await show_picker(target, uid, "tr_pick")
+    else:
+        STATE[uid] = {"mode": "stt"}
+        await target.answer(T[lang_of(uid)]["ask_stt"])
+
+
+@dp.callback_query(F.data.startswith("m:"))
+async def menu_cb(cb: CallbackQuery):
+    uid, what = cb.from_user.id, cb.data.split(":")[1]
+    await cb.answer()
+    if not get_user(uid):
+        await ask_language(cb.message)
+    elif what in ("img", "tts", "tr", "stt"):
+        await choose(cb.message, uid, what)
+
+
+@dp.callback_query(F.data.startswith("sy:"))
+async def style_cb(cb: CallbackQuery):
+    uid, k = cb.from_user.id, cb.data.split(":")[1]
+    await cb.answer()
+    if get_user(uid) and k in STYLES:
+        prefs(uid)["style"] = k
+        await show_picker(cb.message, uid, "size_pick")
+
+
+@dp.callback_query(F.data.startswith("sz:"))
+async def size_cb(cb: CallbackQuery):
+    uid, k = cb.from_user.id, cb.data.split(":")[1]
+    await cb.answer()
+    if get_user(uid) and k in SIZES:
+        l, p = lang_of(uid), prefs(uid)
+        p["size"] = k
+        STATE[uid] = {"mode": "img"}
+        await cb.message.answer(f"{T[l]['st_' + p['style']]} • {T[l]['sz_' + k]}\n{T[l]['ask_img']}")
+
+
+@dp.callback_query(F.data.startswith("v:"))
+async def voice_cb(cb: CallbackQuery):
+    uid, k = cb.from_user.id, cb.data.split(":")[1]
+    await cb.answer()
+    if get_user(uid) and k in PITCH:
+        STATE[uid] = {"mode": "speed_pick", "voice": k}
+        l = lang_of(uid)
+        await cb.message.answer(T[l]["ask_speed"], reply_markup=speed_kb(l))
+
+
+@dp.callback_query(F.data.startswith("sp:"))
+async def speed_cb(cb: CallbackQuery):
+    uid, k = cb.from_user.id, cb.data.split(":")[1]
+    await cb.answer()
+    voice = STATE.get(uid, {}).get("voice")
+    if not get_user(uid) or k not in RATE:
+        return
+    if not voice:
+        return await show_picker(cb.message, uid, "voice_pick")
+    l = lang_of(uid)
+    STATE[uid] = {"mode": "tts", "voice": voice, "speed": k}
+    await cb.message.answer(f"{T[l]['v_' + voice]} • {T[l]['sp_' + k]}\n{T[l]['ask_text']}")
+
+
+@dp.callback_query(F.data.startswith("tl:"))
+async def tl_cb(cb: CallbackQuery):
+    uid, k = cb.from_user.id, cb.data.split(":")[1]
+    await cb.answer()
+    if get_user(uid) and k in VOICES:
+        STATE[uid] = {"mode": "tr", "tl": k}
+        await cb.message.answer(f"{LANG_NAMES[k]}\n{T[lang_of(uid)]['ask_tr_text']}")
+
+
+@dp.callback_query(F.data == "say")
+async def say_cb(cb: CallbackQuery):
+    uid = cb.from_user.id
+    await cb.answer()
+    last = STATE.get(uid, {}).get("last")
+    if not get_user(uid) or not last:
+        return
+    l = lang_of(uid)
+    if limit_hit(uid, "voice"):
+        return await cb.message.answer(T[l]["limit"].format(u=used(uid, "voice"), n=LIMITS["voice"]))
+    try:
+        audio = await synth(last[0][:MAX_LEN], last[1], "boy")
+        add_use(uid, "voice")
+        await cb.message.answer_voice(BufferedInputFile(audio, "voice.ogg"), reply_markup=menu_kb(l))
+    except Exception as e:
+        logging.warning("TTS xatosi: %s", e)
+        await cb.message.answer(T[l]["err"].format(e=str(e)[:200]))
+
+
+# ---------- Ish: rasm, ovoz, tarjima, ovoz->matn ----------
+async def guard(m: Message, l: str, kind: str = None, check_len: bool = True):
+    """Cheklovlarni tekshiradi. Muammo bo'lsa xabar yuborib True qaytaradi."""
+    uid = m.from_user.id
+    if check_len and m.text and len(m.text) > MAX_LEN:
+        await m.answer(T[l]["too_long"])
+        return True
+    if kind and (n := cooldown_left(uid)):
+        await m.answer(T[l]["cooldown"].format(n=n))
+        return True
+    if kind and limit_hit(uid, kind):
+        await m.answer(T[l]["limit"].format(u=used(uid, kind), n=LIMITS[kind]))
+        return True
+    if kind:
+        LAST[uid] = time.monotonic()
+    return False
+
+
+async def do_image(m: Message, l: str):
+    uid = m.from_user.id
+    if await guard(m, l, "img"):
+        return
+    p = prefs(uid)
+    wait = await m.answer(T[l]["wait_img"])
+    try:
+        img = await make_image(m.text, p["style"], p["size"])
+        add_use(uid, "img")
+        try:
+            await m.answer_photo(BufferedInputFile(img, "image.png"), caption=m.text[:900], reply_markup=menu_kb(l))
+        except Exception:
+            await m.answer_document(BufferedInputFile(img, "image.webp"), caption=m.text[:900], reply_markup=menu_kb(l))
+    except Exception as e:
+        await m.answer(T[l]["err"].format(e=str(e)[:200]))
+    finally:
+        await wait.delete()
+
+
+async def do_tts(m: Message, l: str, st: dict):
+    uid = m.from_user.id
+    if await guard(m, l, "voice"):
+        return
+    wait = await m.answer(T[l]["wait_tts"])
+    try:
+        audio = await synth(m.text, l, st["voice"], st.get("speed", "norm"))
+        add_use(uid, "voice")
+        await m.answer_voice(BufferedInputFile(audio, "voice.ogg"), reply_markup=menu_kb(l))
+    except Exception as e:
+        logging.warning("TTS xatosi: %s", e)
+        await m.answer(T[l]["err"].format(e=str(e)[:200]))
+    finally:
+        await wait.delete()
+
+
+async def do_translate(m: Message, l: str, st: dict):
+    if await guard(m, l):
+        return
+    res = await translate(m.text, st["tl"])
+    st["last"] = (res, st["tl"])
+    await m.answer(res[:4000], reply_markup=say_kb(l))
+
+
+async def gate(m: Message):
+    """Ro'yxatdan o'tgan bo'lsa tilini qaytaradi, bo'lmasa ro'yxatdan o'tkazishni boshlaydi."""
+    uid = m.from_user.id
+    if get_user(uid):
+        return lang_of(uid)
+    if uid in PENDING:
+        await m.answer(T[PENDING[uid]]["contact"], reply_markup=contact_kb(PENDING[uid]))
+    else:
+        await ask_language(m)
+    return None
+
+
+@dp.message(F.voice | F.audio | F.video_note, F.chat.type == "private")
+async def on_voice(m: Message):
+    l = await gate(m)
+    if not l:
+        return
+    uid = m.from_user.id
+    obj = m.voice or m.audio or m.video_note
+    if not GEMINI_KEY:
+        return await m.answer(T[l]["stt_off"])
+    if (obj.duration or 0) > 60:
+        return await m.answer(T[l]["stt_long"])
+    if await guard(m, l, "voice"):
+        return
+    mime = "audio/ogg" if m.voice else ("video/mp4" if m.video_note else (obj.mime_type or "audio/mpeg"))
+    wait = await m.answer(T[l]["wait_stt"])
+    try:
+        buf = io.BytesIO()
+        await bot.download(obj, destination=buf)
+        text = await gemini_stt(buf.getvalue(), mime)
+        add_use(uid, "voice")
+        await m.reply(text[:4000] if text else T[l]["stt_empty"], reply_markup=menu_kb(l))
+    except Exception as e:
+        logging.warning("STT xatosi: %s", e)
+        await m.answer(T[l]["err"].format(e=str(e)[:200]))
+    finally:
+        await wait.delete()
+
+
+# ---------- Egasi buyruqlari ----------
+OWNER_ONLY = F.from_user.id == OWNER_ID
+
+
+def total(kind, day=None) -> int:
+    q, a = "SELECT COALESCE(SUM(n),0) FROM usage WHERE kind=?", [kind]
+    if day:
+        q += " AND day=?"
+        a.append(day)
+    return db.execute(q, a).fetchone()[0]
+
+
+@dp.message(Command("stats"), OWNER_ONLY)
+async def cmd_stats(m: Message):
+    n_users = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    new_today = db.execute("SELECT COUNT(*) FROM users WHERE joined LIKE ?", (today() + "%",)).fetchone()[0]
+    d = today()
+    await m.answer(
+        "📊 Statistika\n"
+        f"👥 Foydalanuvchilar: {n_users} (bugun yangi: {new_today})\n"
+        f"🚫 Bloklangan: {len(BANNED)}\n"
+        f"🖼 Rasmlar: {total('img')} (bugun: {total('img', d)})\n"
+        f"🎙 Ovoz amallari: {total('voice')} (bugun: {total('voice', d)})\n"
+        f"💬 Avto-javob: {'yoqilgan' if get_setting('away') else 'o`chirilgan'}\n"
+        f"⚙️ Limit: rasm {DAILY_IMAGES}/kun, ovoz {DAILY_VOICES}/kun")
+
+
+@dp.message(Command("users"), OWNER_ONLY)
+async def cmd_users(m: Message):
+    rows = db.execute("SELECT id, name, username, phone, lang FROM users ORDER BY joined DESC LIMIT 40").fetchall()
+    if not rows:
+        return await m.answer("Hali foydalanuvchi yo'q.")
+    lines = [f"{i}. {n} {('@' + u) if u else ''} {p} [{lg}] ID:{uid}" for i, (uid, n, u, p, lg) in enumerate(rows, 1)]
+    chunk = ""
+    for line in lines:
+        if len(chunk) + len(line) > 3800:
+            await m.answer(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    await m.answer(chunk)
+
+
+@dp.message(Command("broadcast"), OWNER_ONLY)
+async def cmd_broadcast(m: Message, command: CommandObject):
+    if not command.args:
+        return await m.answer("Ishlatilishi: /broadcast matn")
+    ids = [r[0] for r in db.execute("SELECT id FROM users") if r[0] not in BANNED and r[0] != OWNER_ID]
+    ok = fail = 0
+    for uid in ids:
+        try:
+            await bot.send_message(uid, command.args)
+            ok += 1
+        except Exception:
+            fail += 1
+        await asyncio.sleep(0.05)
+    await m.answer(f"📢 Yuborildi: {ok}, yuborilmadi: {fail}")
+
+
+@dp.message(Command("ban"), OWNER_ONLY)
+async def cmd_ban(m: Message, command: CommandObject):
+    if not command.args or not command.args.strip().isdigit():
+        return await m.answer("Ishlatilishi: /ban ID")
+    uid = int(command.args.strip())
+    BANNED.add(uid)
+    db.execute("INSERT OR IGNORE INTO banned VALUES (?)", (uid,))
+    db.commit()
+    await m.answer(f"🚫 {uid} bloklandi.")
+
+
+@dp.message(Command("unban"), OWNER_ONLY)
+async def cmd_unban(m: Message, command: CommandObject):
+    if not command.args or not command.args.strip().isdigit():
+        return await m.answer("Ishlatilishi: /unban ID")
+    uid = int(command.args.strip())
+    BANNED.discard(uid)
+    db.execute("DELETE FROM banned WHERE id=?", (uid,))
+    db.commit()
+    await m.answer(f"✅ {uid} blokdan chiqarildi.")
+
+
+@dp.message(Command("away"), OWNER_ONLY)
+async def cmd_away(m: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg:
+        cur = get_setting("away")
+        return await m.answer(f"💬 Avto-javob: {cur}" if cur else
+                              "Avto-javob o'chiq.\nYoqish: /away matn\nO'chirish: /away off")
+    if arg.lower() == "off":
+        set_setting("away", None)
+        return await m.answer("Avto-javob o'chirildi.")
+    set_setting("away", arg)
+    await m.answer(f"✅ Avto-javob yoqildi:\n{arg}")
+
+
+# ---------- Matn kelganda ----------
+@dp.message(F.text, F.chat.type == "private")
+async def on_text(m: Message):
+    uid = m.from_user.id
+    l = await gate(m)
+    if not l:
+        return
+    t = m.text.strip()
+    if t.startswith("/"):
+        return await m.answer(T[l]["menu"], reply_markup=menu_kb(l))
+    if t in ("1", "2", "3", "4"):
+        return await choose(m, uid, {"1": "img", "2": "tts", "3": "tr", "4": "stt"}[t])
+    st = STATE.get(uid)
+    if not st:
+        await m.answer(T[l]["menu"], reply_markup=menu_kb(l))
+    elif st["mode"] == "img":
+        await do_image(m, l)
+    elif st["mode"] == "tts":
+        await do_tts(m, l, st)
+    elif st["mode"] == "tr":
+        await do_translate(m, l, st)
+    elif st["mode"] == "stt":
+        await m.answer(T[l]["ask_stt"])
+    elif st["mode"] in PICKERS:
+        key, kb = PICKERS[st["mode"]]
+        await m.answer(T[l][key], reply_markup=kb(l))
+
+
+# ---------- Business: tahrirlangan / o'chirilgan / avto-javob ----------
+async def maybe_away(m: Message):
+    text = get_setting("away")
+    if not text or not m.from_user or m.from_user.is_bot or m.from_user.id == OWNER_ID:
+        return
+    if time.monotonic() - AWAY_SENT.get(m.chat.id, -1e9) < 6 * 3600:  # bir odamga 6 soatda 1 marta
+        return
+    AWAY_SENT[m.chat.id] = time.monotonic()
+    await m.answer(text)
+
+
+@dp.business_message()
+async def on_msg(m: Message):
+    save(m)
+    try:
+        await maybe_away(m)
+    except Exception as e:
+        logging.warning("Avto-javob xatosi: %s", e)
+
+
+@dp.edited_business_message()
+async def on_edit(m: Message):
+    old = load(m.chat.id, m.message_id)
+    new_text = text_of(m)
+    ft, fid = media_of(m)
+    if old:
+        changed_media = bool(old[3] and fid and old[3] != fid)
+        if old[1] != new_text or changed_media:
+            await bot.send_message(OWNER_ID, f"✏️ Tahrirlandi ({old[0]})\n\nOldin: {old[1]}\n\nHozir: {new_text}")
+            if changed_media:
+                try:
+                    await send_saved(old[2], old[3], "Oldingi fayl")
+                except Exception as e:
+                    logging.warning("Eski faylni yuborib bo'lmadi: %s", e)
+    save(m)
+
+
+@dp.deleted_business_messages()
+async def on_delete(e: BusinessMessagesDeleted):
+    for mid in e.message_ids:
+        row = load(e.chat.id, mid)
+        if not row:
+            await bot.send_message(OWNER_ID, "🗑 Xabar o'chirildi (bazada yo'q edi).")
+            continue
+        await bot.send_message(OWNER_ID, f"🗑 O'chirildi ({row[0]})\n\n{row[1]}")
+        if row[3]:
+            try:
+                await send_saved(row[2], row[3], f"🗑 {row[0]}")
+            except Exception as ex:
+                logging.warning("O'chirilgan faylni yuborib bo'lmadi: %s", ex)
+
+
+# ---------- Render uchun web server + o'ziga ping ----------
+async def keep_alive():
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "10000"))).start()
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    while url:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession() as s:
+                await s.get(url, timeout=aiohttp.ClientTimeout(total=30))
+        except Exception:
+            pass
+
+
+async def set_commands():
+    try:
+        user_cmds = [BotCommand(command="menu", description="Menu"), BotCommand(command="lang", description="Til / Язык / Language")]
+        await bot.set_my_commands(user_cmds)
+        if OWNER_ID:
+            owner_cmds = user_cmds + [
+                BotCommand(command="stats", description="Statistika"),
+                BotCommand(command="users", description="Foydalanuvchilar"),
+                BotCommand(command="broadcast", description="Hammaga xabar"),
+                BotCommand(command="ban", description="Bloklash"),
+                BotCommand(command="unban", description="Blokdan chiqarish"),
+                BotCommand(command="away", description="Avto-javob"),
+            ]
+            await bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(chat_id=OWNER_ID))
+    except Exception as e:
+        logging.warning("Buyruqlar menyusi o'rnatilmadi: %s", e)
+
+
+async def main():
+    asyncio.create_task(keep_alive())
+    await set_commands()
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
