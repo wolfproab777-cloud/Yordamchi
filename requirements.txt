@@ -1,2 +1,3 @@
 aiogram>=3.13
 anthropic
+openai
