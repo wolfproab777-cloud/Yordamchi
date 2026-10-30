@@ -1,3 +1,9 @@
+
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+    
 import asyncio, base64, logging, os, sqlite3, urllib.parse
 import aiohttp
 from aiohttp import web
@@ -8,6 +14,7 @@ from aiogram.types import BufferedInputFile, BusinessMessagesDeleted, Message
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+HORDE_KEY = os.getenv("HORDE_API_KEY", "0000000000")  # anonim kalit
 GEMINI_MODEL = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 
 logging.basicConfig(level=logging.INFO)
@@ -52,14 +59,24 @@ async def gemini_image(prompt: str) -> bytes:
     raise RuntimeError("Gemini rasm qaytarmadi")
 
 
-async def make_image(prompt: str) -> bytes:
-    if GEMINI_KEY:
-        try:
-            return await gemini_image(prompt)
-        except Exception as e:
-            logging.warning("Gemini xatosi: %s", e)
+async def to_english(text: str) -> str:
+    """O'zbekcha (yoki istalgan tildagi) gapni inglizchaga o'giradi (kalitsiz)."""
+    try:
+        async with aiohttp.ClientSession() as s, s.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "en", "dt": "t", "q": text},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as r:
+            data = await r.json(content_type=None)
+        return "".join(seg[0] for seg in data[0] if seg[0]).strip() or text
+    except Exception as e:
+        logging.warning("Tarjima xatosi: %s", e)
+        return text
+
+
+async def pollinations_image(prompt: str) -> bytes:
     url = "https://image.pollinations.ai/prompt/" + urllib.parse.quote(prompt) + "?width=1024&height=1024&nologo=true"
-    for attempt in range(4):  # bepul server band bo'lsa, 4 martagacha qayta uriniladi
+    for attempt in range(2):
         try:
             async with aiohttp.ClientSession() as s, s.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
                 if r.status == 200:
@@ -67,8 +84,57 @@ async def make_image(prompt: str) -> bytes:
                 logging.warning("Pollinations %s (urinish %s)", r.status, attempt + 1)
         except Exception as e:
             logging.warning("Pollinations xatosi: %s", e)
-        await asyncio.sleep(5)
-    raise RuntimeError("Bepul rasm serveri hozir band. Birozdan keyin qayta urinib ko'ring.")
+        await asyncio.sleep(3)
+    raise RuntimeError("Pollinations band")
+
+
+HORDE = "https://aihorde.net/api/v2"
+
+
+async def horde_image(prompt: str) -> bytes:
+    """AI Horde (anonim, kalitsiz). Navbat bo'lsa, bir necha daqiqa kutadi."""
+    headers = {"apikey": HORDE_KEY, "Client-Agent": "yordamchi-bot:1.0:telegram"}
+    body = {"prompt": prompt, "params": {"width": 512, "height": 512, "steps": 25, "n": 1}, "nsfw": False}
+    async with aiohttp.ClientSession(headers=headers) as s:
+        async with s.post(f"{HORDE}/generate/async", json=body) as r:
+            data = await r.json()
+            if r.status not in (200, 202):
+                raise RuntimeError(f"Horde {r.status}: {data.get('message', data)}")
+            job = data["id"]
+        for _ in range(72):  # 72 * 5 soniya = 6 daqiqagacha
+            await asyncio.sleep(5)
+            async with s.get(f"{HORDE}/generate/check/{job}") as r:
+                st = await r.json()
+            if st.get("faulted"):
+                raise RuntimeError("Horde: xatolik yuz berdi")
+            if st.get("done"):
+                break
+        else:
+            raise RuntimeError("Horde: navbat juda uzun")
+        async with s.get(f"{HORDE}/generate/status/{job}") as r:
+            st = await r.json()
+    img = st["generations"][0]["img"]
+    if img.startswith("http"):
+        async with aiohttp.ClientSession() as s2, s2.get(img, timeout=aiohttp.ClientTimeout(total=60)) as r:
+            return await r.read()
+    return base64.b64decode(img)
+
+
+async def make_image(text: str) -> bytes:
+    # 1) Gemini kaliti bo'lsa: o'zbekchani o'zi tushunadi
+    if GEMINI_KEY:
+        try:
+            return await gemini_image(text)
+        except Exception as e:
+            logging.warning("Gemini xatosi: %s", e)
+    # 2) Inglizchaga o'girib, bepul xizmatlar: avval Pollinations, keyin AI Horde
+    prompt = await to_english(text)
+    logging.info("Inglizcha prompt: %s", prompt)
+    try:
+        return await pollinations_image(prompt)
+    except Exception as e:
+        logging.warning("Pollinations ishlamadi, AI Horde sinaladi: %s", e)
+    return await horde_image(prompt)
 
 
 @dp.message(CommandStart())
@@ -84,7 +150,10 @@ async def generate(m: Message):
     wait = await m.answer("Rasm tayyorlanmoqda...")
     try:
         img = await make_image(m.text)
-        await m.answer_photo(BufferedInputFile(img, "image.png"), caption=m.text[:900])
+        try:
+            await m.answer_photo(BufferedInputFile(img, "image.png"), caption=m.text[:900])
+        except Exception:
+            await m.answer_document(BufferedInputFile(img, "image.webp"), caption=m.text[:900])
     except Exception as e:
         await m.answer(f"Xatolik: {e}")
     finally:
@@ -136,4 +205,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+mi
