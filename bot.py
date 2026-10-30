@@ -1,9 +1,3 @@
-
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
-    
 import asyncio, base64, logging, os, sqlite3, urllib.parse
 import aiohttp
 from aiohttp import web
